@@ -1,18 +1,2 @@
-# LightAgent - Smart Lighting Controller
-# Python 3.10+
-
-# HTTP client
-httpx==0.27.0
-
-# Data validation
-pydantic==2.5.3
-
-# Async support
-asyncio-throttle==1.0.2
-
-# Logging
-rich==13.7.0
-
-# Configuration
-python-dotenv==1.0.0
-
+# LightAgent - prosty agent oświetlenia
+aiohttp>=3.9.0
