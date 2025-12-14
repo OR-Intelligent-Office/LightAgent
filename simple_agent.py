@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
+"""
+Prosty LightAgent - pobiera stan z symulatora i steruje światłami.
+
+Funkcje:
+- Włącza światła gdy są osoby w pokoju
+- Włącza światła 1 minutę przed zaplanowanym spotkaniem
+- Wyłącza światła po 5 minutach bez osób
+- Dostosowuje jasność do światła dziennego
+"""
+
 import asyncio
 import aiohttp
 import logging
 import sys
+from datetime import datetime, timedelta
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,12 +33,20 @@ class SimpleLightAgent:
         # Konfiguracja
         self.poll_interval = 2.0  # sekundy
         self.daylight_threshold = 0.3  # próg światła dziennego
+        self.minutes_before_meeting = 1  # włącz światło X minut przed spotkaniem
+        self.minutes_to_turn_off = 5  # wyłącz po X minutach bez osób
+        
+        # Śledzenie czasu bez osób dla każdego pokoju
+        # room_id -> datetime kiedy ostatnio były osoby
+        self.last_people_time: dict[str, datetime] = {}
     
     async def start(self):
         """Uruchamia agenta."""
         self.session = aiohttp.ClientSession()
         self.running = True
         logger.info(f"🚀 LightAgent uruchomiony - {self.simulator_url}")
+        logger.info(f"   Włączanie przed spotkaniem: {self.minutes_before_meeting} min")
+        logger.info(f"   Wyłączanie po braku osób: {self.minutes_to_turn_off} min")
         
         try:
             while self.running:
@@ -73,9 +92,37 @@ class SimpleLightAgent:
     
     def calculate_brightness(self, daylight: float) -> int:
         """Oblicza jasność na podstawie światła dziennego."""
-        # Im więcej światła dziennego, tym mniejsza jasność
         brightness = int(100 - (daylight * 70))  # 30-100%
         return max(30, min(100, brightness))
+    
+    def has_upcoming_meeting(self, meetings: list, simulation_time: datetime) -> bool:
+        """Sprawdza czy jest spotkanie w ciągu X minut."""
+        for meeting in meetings:
+            try:
+                start_time = datetime.fromisoformat(meeting.get("startTime", ""))
+                time_until = (start_time - simulation_time).total_seconds() / 60  # minuty
+                
+                # Spotkanie zaczyna się za 0-X minut
+                if 0 <= time_until <= self.minutes_before_meeting:
+                    return True
+                    
+                # Spotkanie trwa teraz
+                end_time = datetime.fromisoformat(meeting.get("endTime", ""))
+                if start_time <= simulation_time <= end_time:
+                    return True
+                    
+            except (ValueError, TypeError):
+                continue
+        return False
+    
+    def should_turn_off(self, room_id: str, current_time: datetime) -> bool:
+        """Sprawdza czy minęło wystarczająco czasu bez osób aby wyłączyć."""
+        last_time = self.last_people_time.get(room_id)
+        if last_time is None:
+            return True  # Nigdy nie było osób - wyłącz
+        
+        minutes_without_people = (current_time - last_time).total_seconds() / 60
+        return minutes_without_people >= self.minutes_to_turn_off
     
     async def run_cycle(self):
         """Jeden cykl działania agenta."""
@@ -87,16 +134,36 @@ class SimpleLightAgent:
         daylight = state.get("daylightIntensity", 1.0)
         rooms = state.get("rooms", [])
         
+        # Parsuj czas symulacji
+        try:
+            sim_time_str = state.get("simulationTime", "")
+            simulation_time = datetime.fromisoformat(sim_time_str)
+        except (ValueError, TypeError):
+            simulation_time = datetime.now()
+        
         if power_outage:
             logger.warning("⚡ Awaria zasilania - światła niedostępne")
             return
         
         target_brightness = self.calculate_brightness(daylight)
+        current_time = datetime.now()
         
         for room in rooms:
+            room_id = room.get("id", "")
             room_name = room.get("name", "?")
             people_count = room.get("peopleCount", 0)
             lights = room.get("lights", [])
+            meetings = room.get("scheduledMeetings", [])
+            
+            # Aktualizuj czas ostatnich osób
+            if people_count > 0:
+                self.last_people_time[room_id] = current_time
+            
+            # Sprawdź czy jest nadchodzące spotkanie
+            meeting_soon = self.has_upcoming_meeting(meetings, simulation_time)
+            
+            # Czy światła powinny być włączone?
+            should_be_on = people_count > 0 or meeting_soon
             
             for light in lights:
                 light_id = light.get("id", "")
@@ -104,21 +171,23 @@ class SimpleLightAgent:
                 light_brightness = light.get("brightness", 100)
                 
                 is_on = light_state == "ON"
-                should_be_on = people_count > 0
                 
-                # Włącz światło jeśli są osoby
+                # WŁĄCZ światło
                 if should_be_on and not is_on:
+                    reason = "spotkanie za chwilę" if meeting_soon else f"{people_count} os."
                     success = await self.set_light(light_id, "ON", target_brightness)
                     if success:
-                        logger.info(f"✅ WŁĄCZONO {light_id} w {room_name} (jasność: {target_brightness}%)")
+                        logger.info(f"✅ WŁĄCZONO {light_id} w {room_name} ({reason}, jasność: {target_brightness}%)")
                 
-                # Wyłącz światło jeśli brak osób
+                # WYŁĄCZ światło (po 5 min bez osób)
                 elif not should_be_on and is_on:
-                    success = await self.set_light(light_id, "OFF")
-                    if success:
-                        logger.info(f"❌ WYŁĄCZONO {light_id} w {room_name}")
+                    if self.should_turn_off(room_id, current_time):
+                        success = await self.set_light(light_id, "OFF")
+                        if success:
+                            logger.info(f"❌ WYŁĄCZONO {light_id} w {room_name} (brak osób przez {self.minutes_to_turn_off} min)")
+                    # else: czekamy jeszcze
                 
-                # Dostosuj jasność jeśli potrzeba
+                # Dostosuj jasność
                 elif is_on and abs(light_brightness - target_brightness) > 10:
                     success = await self.set_light(light_id, "ON", target_brightness)
                     if success:
@@ -139,4 +208,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
