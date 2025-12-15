@@ -7,13 +7,14 @@ Funkcje:
 - Włącza światła 1 minutę przed zaplanowanym spotkaniem
 - Wyłącza światła po 5 minutach bez osób
 - Dostosowuje jasność do światła dziennego
+- Wykrywa awarie świateł (BROKEN)
 """
 
 import asyncio
 import aiohttp
 import logging
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +39,9 @@ class SimpleLightAgent:
         
         # room_id -> datetime kiedy ostatnio były osoby
         self.last_people_time: dict[str, datetime] = {}
+        
+        # Śledzenie zepsutych świateł (żeby nie logować ciągle)
+        self.broken_lights: set[str] = set()
     
     async def start(self):
         self.session = aiohttp.ClientSession()
@@ -58,7 +62,6 @@ class SimpleLightAgent:
         logger.info("LightAgent zatrzymany")
     
     async def get_state(self) -> dict | None:
-        """Pobiera stan środowiska z symulatora."""
         try:
             async with self.session.get(f"{self.simulator_url}/api/environment/state") as resp:
                 if resp.status == 200:
@@ -71,7 +74,6 @@ class SimpleLightAgent:
             return None
     
     async def set_light(self, light_id: str, state: str, brightness: int = 100) -> bool:
-        """Ustawia stan światła."""
         try:
             payload = {"state": state, "brightness": brightness}
             url = f"{self.simulator_url}/api/environment/devices/light/{light_id}/control"
@@ -88,22 +90,18 @@ class SimpleLightAgent:
             return False
     
     def calculate_brightness(self, daylight: float) -> int:
-        """Oblicza jasność na podstawie światła dziennego."""
-        brightness = int(100 - (daylight * 70))  # 30-100%
+        brightness = int(100 - (daylight * 70))
         return max(30, min(100, brightness))
     
     def has_upcoming_meeting(self, meetings: list, simulation_time: datetime) -> bool:
-        """Sprawdza czy jest spotkanie w ciągu X minut."""
         for meeting in meetings:
             try:
                 start_time = datetime.fromisoformat(meeting.get("startTime", ""))
-                time_until = (start_time - simulation_time).total_seconds() / 60  # minuty
+                time_until = (start_time - simulation_time).total_seconds() / 60
                 
-                # Spotkanie zaczyna się za 0-X minut
                 if 0 <= time_until <= self.minutes_before_meeting:
                     return True
                     
-                # Spotkanie trwa
                 end_time = datetime.fromisoformat(meeting.get("endTime", ""))
                 if start_time <= simulation_time <= end_time:
                     return True
@@ -113,7 +111,6 @@ class SimpleLightAgent:
         return False
     
     def should_turn_off(self, room_id: str, current_time: datetime) -> bool:
-        """Sprawdza czy minęło wystarczająco czasu bez osób aby wyłączyć."""
         last_time = self.last_people_time.get(room_id)
         if last_time is None:
             return True  
@@ -122,7 +119,6 @@ class SimpleLightAgent:
         return minutes_without_people >= self.minutes_to_turn_off
     
     async def run_cycle(self):
-        """Jeden cykl działania agenta."""
         state = await self.get_state()
         if not state:
             return
@@ -138,7 +134,7 @@ class SimpleLightAgent:
             simulation_time = datetime.now()
         
         if power_outage:
-            logger.warning("⚡ Awaria zasilania - światła niedostępne")
+            logger.warning("Awaria zasilania - światła niedostępne")
             return
         
         target_brightness = self.calculate_brightness(daylight)
@@ -153,9 +149,8 @@ class SimpleLightAgent:
             
             if people_count > 0:
                 self.last_people_time[room_id] = current_time
-            e
-            meeting_soon = self.has_upcoming_meeting(meetings, simulation_time)
             
+            meeting_soon = self.has_upcoming_meeting(meetings, simulation_time)
             should_be_on = people_count > 0 or meeting_soon
             
             for light in lights:
@@ -163,9 +158,23 @@ class SimpleLightAgent:
                 light_state = light.get("state", "OFF")
                 light_brightness = light.get("brightness", 100)
                 
+                # Sprawdź czy światło jest zepsute
+                is_broken = light_state == "BROKEN"
+                
+                if is_broken:
+                    # Loguj awarię tylko raz
+                    if light_id not in self.broken_lights:
+                        self.broken_lights.add(light_id)
+                        logger.warning(f"AWARIA {light_id} w {room_name} - światło zepsute!")
+                    continue  # Pomiń zepsute światło
+                else:
+                    # Światło naprawione - usuń z listy zepsutych
+                    if light_id in self.broken_lights:
+                        self.broken_lights.remove(light_id)
+                        logger.info(f"NAPRAWIONO {light_id} w {room_name}")
+                
                 is_on = light_state == "ON"
                 
-
                 if should_be_on and not is_on:
                     reason = "spotkanie za chwilę" if meeting_soon else f"{people_count} os."
                     success = await self.set_light(light_id, "ON", target_brightness)
@@ -181,7 +190,7 @@ class SimpleLightAgent:
                 elif is_on and abs(light_brightness - target_brightness) > 10:
                     success = await self.set_light(light_id, "ON", target_brightness)
                     if success:
-                        logger.info(f"Jasność {light_id}: {light_brightness}% → {target_brightness}%")
+                        logger.info(f"Jasność {light_id}: {light_brightness}% -> {target_brightness}%")
 
 
 async def main():
