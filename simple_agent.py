@@ -37,7 +37,7 @@ class SimpleLightAgent:
         self.minutes_before_meeting = 1 
         self.minutes_to_turn_off = 5 
         
-        # room_id -> datetime kiedy ostatnio były osoby
+        # room_id -> simulation_time kiedy ostatnio były osoby
         self.last_people_time: dict[str, datetime] = {}
         
         # Śledzenie zepsutych świateł (żeby nie logować ciągle)
@@ -110,12 +110,13 @@ class SimpleLightAgent:
                 continue
         return False
     
-    def should_turn_off(self, room_id: str, current_time: datetime) -> bool:
+    def should_turn_off(self, room_id: str, simulation_time: datetime) -> bool:
+        """Sprawdza czy minęło wystarczająco dużo czasu (symulacji) bez osób."""
         last_time = self.last_people_time.get(room_id)
         if last_time is None:
-            return True  
+            return True  # Nigdy nie było osób - gasić
         
-        minutes_without_people = (current_time - last_time).total_seconds() / 60
+        minutes_without_people = (simulation_time - last_time).total_seconds() / 60
         return minutes_without_people >= self.minutes_to_turn_off
     
     async def run_cycle(self):
@@ -138,7 +139,6 @@ class SimpleLightAgent:
             return
         
         target_brightness = self.calculate_brightness(daylight)
-        current_time = datetime.now()
         
         for room in rooms:
             room_id = room.get("id", "")
@@ -147,8 +147,9 @@ class SimpleLightAgent:
             lights = room.get("lights", [])
             meetings = room.get("scheduledMeetings", [])
             
+            # Używamy czasu symulacji do śledzenia obecności osób
             if people_count > 0:
-                self.last_people_time[room_id] = current_time
+                self.last_people_time[room_id] = simulation_time
             
             meeting_soon = self.has_upcoming_meeting(meetings, simulation_time)
             should_be_on = people_count > 0 or meeting_soon
@@ -182,10 +183,10 @@ class SimpleLightAgent:
                         logger.info(f"WŁĄCZONO {light_id} w {room_name} ({reason}, jasność: {target_brightness}%)")
                 
                 elif not should_be_on and is_on:
-                    if self.should_turn_off(room_id, current_time):
+                    if self.should_turn_off(room_id, simulation_time):
                         success = await self.set_light(light_id, "OFF")
                         if success:
-                            logger.info(f"WYŁĄCZONO {light_id} w {room_name} (brak osób przez {self.minutes_to_turn_off} min)")
+                            logger.info(f"WYŁĄCZONO {light_id} w {room_name} (brak osób przez {self.minutes_to_turn_off} min symulacji)")
                 
                 elif is_on and abs(light_brightness - target_brightness) > 10:
                     success = await self.set_light(light_id, "ON", target_brightness)
